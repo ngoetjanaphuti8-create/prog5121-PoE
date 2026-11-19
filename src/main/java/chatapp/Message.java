@@ -1,316 +1,340 @@
 package chatapp;
 
-import java.util.Scanner;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonParseException;
+import com.google.gson.reflect.TypeToken;
+
+import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
+import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * Main.java
+ * Message.java
  *
- * Console entry point for the PROG5121 PoE - QuickChat.
+ * PROG5121 - Part 2: Sending Messages.
  *
- * The user registers and logs in (Part 1), then uses QuickChat to send,
- * disregard and store messages (Part 2). Every message is kept in arrays,
- * and the Stored Messages menu lets the user search, delete and report on
- * them (Part 3).
+ * Represents a single QuickChat message. It generates the message ID and
+ * message hash, validates the recipient and message length, lets the user
+ * send / disregard / store the message, and keeps track of every message
+ * sent while the program is running.
+ *
+ * JSON storage: the approach of converting Java objects to JSON with Gson's
+ * toJson() and reading them back with fromJson() and a TypeToken follows
+ * the examples in:
+ * Google, "Gson User Guide". Available at: https://google.github.io/gson/UserGuide.html
+ * (accessed October 2026).
  */
-public class Main {
+public class Message {
 
-    private static final int MAX_LOGIN_ATTEMPTS = 3;
+    // Menu options offered once a message has been completed.
+    public static final int SEND_MESSAGE = 1;
+    public static final int DISREGARD_MESSAGE = 2;
+    public static final int STORE_MESSAGE = 3;
 
-    public static void main(String[] args) {
-        Scanner scanner = new Scanner(System.in);
-        Login login = new Login();
+    private static final int MAX_MESSAGE_LENGTH = 250;
+    private static final int MESSAGE_ID_LENGTH = 10;
 
-        registerNewUser(scanner, login);
+    // Part 1's cell phone checker is reused to validate the recipient.
+    private static final Login CELL_VALIDATOR = new Login();
 
-        if (!logIn(scanner, login)) {
-            System.out.println("Too many failed login attempts. Goodbye.");
-            scanner.close();
-            return;
-        }
+    // Gson converts the Message objects to and from JSON.
+    private static final Gson GSON = new GsonBuilder()
+            .setPrettyPrinting()
+            .disableHtmlEscaping()
+            .create();
 
-        String senderName = login.getFirstName() + " " + login.getLastName();
-        runQuickChat(scanner, senderName);
-        scanner.close();
+    // Every message sent while the program is running.
+    private static final List<Message> sentMessages = new ArrayList<>();
+
+    // The JSON file that stored messages are written to.
+    private static Path storageFile = Paths.get("storedMessages.json");
+
+    private final String messageID;
+    private final int messageNumber;
+    private final String recipient;
+    private final String messageText;
+    private final String messageHash;
+
+    /**
+     * Creates a message with an automatically generated, random ten-digit ID.
+     *
+     * @param messageNumber the message's number (the loop counter, starting at 0)
+     * @param recipient     the recipient's cell phone number
+     * @param messageText   the message text
+     */
+    public Message(int messageNumber, String recipient, String messageText) {
+        this(generateMessageID(), messageNumber, recipient, messageText);
     }
 
-    // ---------- Part 1: registration and login ----------
-
-    private static void registerNewUser(Scanner scanner, Login login) {
-        System.out.println("=== Registration ===");
-
-        System.out.print("Enter your first name: ");
-        String firstName = scanner.nextLine();
-
-        System.out.print("Enter your last name: ");
-        String lastName = scanner.nextLine();
-
-        String username;
-        do {
-            System.out.print("Enter a username (must contain an underscore and be no more than 5 characters): ");
-            username = scanner.nextLine();
-            if (!login.checkUserName(username)) {
-                System.out.println("Username is not correctly formatted; please ensure that your "
-                        + "username contains an underscore and is no more than five characters in length.");
-            }
-        } while (!login.checkUserName(username));
-
-        String password;
-        do {
-            System.out.print("Enter a password (min 8 characters, 1 capital letter, 1 number, 1 special character): ");
-            password = scanner.nextLine();
-            if (!login.checkPasswordComplexity(password)) {
-                System.out.println("Password is not correctly formatted; please ensure that the "
-                        + "password contains at least eight characters, a capital letter, a number, "
-                        + "and a special character.");
-            }
-        } while (!login.checkPasswordComplexity(password));
-
-        String cellphoneNumber;
-        do {
-            System.out.print("Enter your cell phone number (with international code, e.g. +27838968976): ");
-            cellphoneNumber = scanner.nextLine();
-            if (!login.checkCellPhoneNumber(cellphoneNumber)) {
-                System.out.println("Cell number is incorrectly formatted or does not contain "
-                        + "international code; please correct the number and try again.");
-            }
-        } while (!login.checkCellPhoneNumber(cellphoneNumber));
-
-        System.out.println(login.registerUser(firstName, lastName, username, password, cellphoneNumber));
+    /**
+     * Creates a message with a specific ID (used for testing, where the
+     * hash has to be predictable).
+     *
+     * @param messageID     the ten-digit message ID
+     * @param messageNumber the message's number (the loop counter, starting at 0)
+     * @param recipient     the recipient's cell phone number
+     * @param messageText   the message text
+     */
+    public Message(String messageID, int messageNumber, String recipient, String messageText) {
+        this.messageID = messageID;
+        this.messageNumber = messageNumber;
+        this.recipient = recipient;
+        this.messageText = messageText;
+        this.messageHash = buildHash(messageID, messageNumber, messageText);
     }
 
-    // Gives the user a limited number of attempts to log in.
-    private static boolean logIn(Scanner scanner, Login login) {
-        System.out.println("\n=== Please log in ===");
-        for (int attempt = 1; attempt <= MAX_LOGIN_ATTEMPTS; attempt++) {
-            System.out.print("Enter your username: ");
-            String username = scanner.nextLine();
-            System.out.print("Enter your password: ");
-            String password = scanner.nextLine();
-
-            boolean loggedIn = login.loginUser(username, password);
-            System.out.println(login.returnLoginStatus(loggedIn));
-            if (loggedIn) {
-                return true;
-            }
+    /**
+     * Generates a random ten-digit message ID, built one digit at a time.
+     * A leading zero is allowed, so the ID is kept as a String.
+     *
+     * @return a ten-digit message ID
+     */
+    public static String generateMessageID() {
+        StringBuilder id = new StringBuilder();
+        for (int i = 0; i < MESSAGE_ID_LENGTH; i++) {
+            id.append(ThreadLocalRandom.current().nextInt(10));
         }
-        return false;
+        return id.toString();
     }
 
-    // ---------- Part 2: QuickChat ----------
-
-    private static void runQuickChat(Scanner scanner, String senderName) {
-        System.out.println("\nWelcome to QuickChat.");
-
-        int numMessages = readNumber(scanner, "How many messages do you wish to enter? ", 1, 1000);
-
-        // The arrays are sized from the number of messages the user chose, and
-        // the stored messages already in the JSON file are read into them.
-        MessageManager manager = new MessageManager(numMessages);
-        int alreadyStored = manager.getStoredMessageTexts().length;
-        if (alreadyStored > 0) {
-            System.out.println(alreadyStored + " previously stored message(s) loaded from the JSON file.");
-        }
-
-        int messagesEntered = 0;
-        boolean running = true;
-        while (running) {
-            System.out.println("\n1) Send Messages");
-            System.out.println("2) Show recently sent messages");
-            System.out.println("3) Quit");
-            System.out.println("4) Stored Messages");
-            int choice = readNumber(scanner, "Choose an option: ", 1, 4);
-
-            switch (choice) {
-                case 1:
-                    if (messagesEntered >= numMessages) {
-                        System.out.println("You have already entered all " + numMessages + " message(s).");
-                    } else {
-                        messagesEntered = sendMessages(scanner, numMessages, messagesEntered, manager);
-                        System.out.println("\nTotal number of messages sent: " + Message.returnTotalMessages());
-                    }
-                    break;
-                case 2:
-                    System.out.println("Coming Soon.");
-                    break;
-                case 4:
-                    runStoredMessagesMenu(scanner, manager, senderName);
-                    break;
-                default:
-                    System.out.println("Goodbye.");
-                    running = false;
-                    break;
-            }
-        }
+    /**
+     * Checks that the message ID is not more than ten characters long.
+     *
+     * @return true if the message ID is valid, false otherwise
+     */
+    public boolean checkMessageID() {
+        return messageID != null && messageID.length() <= MESSAGE_ID_LENGTH;
     }
 
-    // Lets the user enter the messages they said they wanted to send. The for
-    // loop counter is the message number used in the message hash.
-    private static int sendMessages(Scanner scanner, int numMessages, int startIndex,
-                                    MessageManager manager) {
-        for (int i = startIndex; i < numMessages; i++) {
-            System.out.println("\n--- Message " + (i + 1) + " of " + numMessages + " ---");
-
-            String recipient = readValidRecipient(scanner);
-            String text = readValidMessage(scanner);
-
-            Message message = new Message(i, recipient, text);
-            System.out.println(message.messageIDGeneratedMessage());
-
-            System.out.println("1) Send Message");
-            System.out.println("2) Disregard Message");
-            System.out.println("3) Store Message to send later");
-            int option = readNumber(scanner, "Choose an option: ", 1, 3);
-
-            System.out.println(message.sentMessage(option));
-
-            if (option == Message.DISREGARD_MESSAGE) {
-                confirmDeletion(scanner);
-            } else if (option == Message.SEND_MESSAGE) {
-                System.out.println("\n" + message.getDetails());
-            }
-
-            // Part 3: the message also goes into the matching array.
-            manager.addMessage(message, option);
-        }
-        return numMessages;
+    /**
+     * Confirms that the message ID has been created.
+     *
+     * @return "Message ID generated: " followed by the message ID
+     */
+    public String messageIDGeneratedMessage() {
+        return "Message ID generated: " + messageID;
     }
 
-    private static String readValidRecipient(Scanner scanner) {
-        while (true) {
-            System.out.print("Enter the recipient's cell number (with international code): ");
-            String recipient = scanner.nextLine().trim();
-            String result = Message.checkRecipientCell(recipient);
-            System.out.println(result);
-            if (result.equals("Cell phone number successfully captured.")) {
-                return recipient;
-            }
+    /**
+     * Checks that a recipient cell number contains an international code
+     * and is correctly formatted. This reuses the Part 1 cell phone checker.
+     *
+     * @param recipient the cell number to check
+     * @return a success or failure message
+     */
+    public static String checkRecipientCell(String recipient) {
+        if (CELL_VALIDATOR.checkCellPhoneNumber(recipient)) {
+            return "Cell phone number successfully captured.";
         }
+        return "Cell phone number is incorrectly formatted or does not contain "
+                + "an international code. Please correct the number and try again.";
     }
 
-    private static String readValidMessage(Scanner scanner) {
-        while (true) {
-            System.out.print("Enter your message (max 250 characters): ");
-            String text = scanner.nextLine();
-            if (text.trim().isEmpty()) {
-                System.out.println("A message cannot be empty.");
-                continue;
-            }
-            String result = Message.checkMessageLength(text);
-            if (result.equals("Message ready to send.")) {
-                System.out.println(result);
-                return text;
-            }
-            System.out.println("Please enter a message of less than 250 characters.");
-            System.out.println(result);
+    /**
+     * Checks this message's recipient cell number.
+     *
+     * @return a success or failure message
+     */
+    public String checkRecipientCell() {
+        return checkRecipientCell(recipient);
+    }
+
+    /**
+     * Checks that a message does not exceed 250 characters.
+     *
+     * @param text the message text
+     * @return a success message, or a failure message saying how many
+     *         characters over the limit the message is
+     */
+    public static String checkMessageLength(String text) {
+        int length = (text == null) ? 0 : text.length();
+        if (length <= MAX_MESSAGE_LENGTH) {
+            return "Message ready to send.";
+        }
+        int excess = length - MAX_MESSAGE_LENGTH;
+        return "Message exceeds 250 characters by " + excess + "; please reduce the size.";
+    }
+
+    /**
+     * Checks this message's length.
+     *
+     * @return a success or failure message
+     */
+    public String checkMessageLength() {
+        return checkMessageLength(messageText);
+    }
+
+    /**
+     * Creates and returns the message hash: the first two digits of the
+     * message ID, a colon, the message number, a colon, then the first and
+     * last words of the message, all in capital letters (e.g. 00:0:HITONIGHT).
+     *
+     * @return the message hash
+     */
+    public String createMessageHash() {
+        return buildHash(messageID, messageNumber, messageText);
+    }
+
+    // Builds the hash using string manipulation (substring, split, replaceAll).
+    private static String buildHash(String id, int number, String text) {
+        String prefix = (id.length() >= 2) ? id.substring(0, 2) : id;
+        String[] words = text.trim().split("\\s+");
+        String firstWord = cleanWord(words[0]);
+        String lastWord = cleanWord(words[words.length - 1]);
+        return (prefix + ":" + number + ":" + firstWord + lastWord).toUpperCase();
+    }
+
+    // Removes punctuation (such as the "?" in "tonight?") so only letters and digits remain.
+    private static String cleanWord(String word) {
+        return word.replaceAll("[^\\p{L}\\p{N}]", "");
+    }
+
+    /**
+     * Applies the option the user chose for this message.
+     *
+     * @param choice 1 = send, 2 = disregard, 3 = store to send later
+     * @return the message to show the user
+     */
+    public String sentMessage(int choice) {
+        switch (choice) {
+            case SEND_MESSAGE:
+                sentMessages.add(this);
+                return "Message successfully sent.";
+            case DISREGARD_MESSAGE:
+                return "Press 0 to delete the message.";
+            case STORE_MESSAGE:
+                return storeMessage();
+            default:
+                return "Invalid option; please choose 1, 2 or 3.";
         }
     }
 
-    // The user has to enter 0 to confirm that the message must be deleted.
-    private static void confirmDeletion(Scanner scanner) {
-        String input;
-        do {
-            System.out.print("> ");
-            input = scanner.nextLine().trim();
-        } while (!input.equals("0"));
-        System.out.println("Message deleted.");
+    /**
+     * Stores this message in the JSON file. Messages already in the file are
+     * read first, so storing a new message never overwrites earlier ones.
+     *
+     * @return a success message, or an error message if the file could not be written
+     */
+    public String storeMessage() {
+        List<Message> stored = loadStoredMessages();
+        stored.add(this);
+        if (saveStoredMessages(stored)) {
+            return "Message successfully stored.";
+        }
+        return "Message could not be stored: the JSON file could not be written.";
     }
 
-    // ---------- Part 3: Stored Messages ----------
+    /**
+     * Writes the given messages to the JSON file, replacing its contents.
+     * Used when a stored message is added and when one is deleted.
+     *
+     * @param messages the messages the file should contain
+     * @return true if the file was written, false if writing failed
+     */
+    public static boolean saveStoredMessages(List<Message> messages) {
+        try (Writer writer = Files.newBufferedWriter(storageFile, StandardCharsets.UTF_8)) {
+            GSON.toJson(messages, writer);
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
 
-    private static void runStoredMessagesMenu(Scanner scanner, MessageManager manager,
-                                              String senderName) {
-        boolean back = false;
-        while (!back) {
-            System.out.println("\n=== Stored Messages ===");
-            System.out.println("1) Display the sender and recipient of all stored messages");
-            System.out.println("2) Display the longest stored message");
-            System.out.println("3) Search for a message ID");
-            System.out.println("4) Search for all messages sent or stored for a recipient");
-            System.out.println("5) Delete a message using its message hash");
-            System.out.println("6) Display a report of all stored messages");
-            System.out.println("7) Display a report of all sent messages");
-            System.out.println("0) Back to the main menu");
-            int choice = readNumber(scanner, "Choose an option: ", 0, 7);
+    /**
+     * Reads the stored messages back from the JSON file.
+     *
+     * @return the stored messages (an empty list if there are none yet)
+     */
+    public static List<Message> loadStoredMessages() {
+        if (!Files.exists(storageFile)) {
+            return new ArrayList<>();
+        }
+        Type listType = new TypeToken<List<Message>>() { }.getType();
+        try (Reader reader = Files.newBufferedReader(storageFile, StandardCharsets.UTF_8)) {
+            List<Message> loaded = GSON.fromJson(reader, listType);
+            return (loaded == null) ? new ArrayList<>() : loaded;
+        } catch (IOException | JsonParseException e) {
+            return new ArrayList<>();
+        }
+    }
 
-            switch (choice) {
-                case 1:
-                    System.out.println(manager.displaySenderAndRecipient(senderName));
-                    break;
-                case 2:
-                    showLongestStoredMessage(manager);
-                    break;
-                case 3:
-                    searchForMessageID(scanner, manager);
-                    break;
-                case 4:
-                    searchForRecipient(scanner, manager);
-                    break;
-                case 5:
-                    System.out.print("Enter the message hash: ");
-                    String hash = scanner.nextLine().trim();
-                    System.out.println(manager.deleteMessageByHash(hash));
-                    break;
-                case 6:
-                    System.out.println(manager.displayReport());
-                    break;
-                case 7:
-                    System.out.println(manager.displaySentReport());
-                    break;
-                default:
-                    back = true;
-                    break;
+    /**
+     * Returns this message's full details in the required order:
+     * Message ID, Message Hash, Recipient, Message.
+     *
+     * @return the message details
+     */
+    public String getDetails() {
+        return "Message ID: " + messageID + "\n"
+                + "Message Hash: " + messageHash + "\n"
+                + "Recipient: " + recipient + "\n"
+                + "Message: " + messageText;
+    }
+
+    /**
+     * Returns every message sent while the program has been running.
+     *
+     * @return the details of all sent messages, or a note if none have been sent
+     */
+    public static String printMessages() {
+        if (sentMessages.isEmpty()) {
+            return "No messages have been sent.";
+        }
+        StringBuilder all = new StringBuilder();
+        for (int i = 0; i < sentMessages.size(); i++) {
+            if (i > 0) {
+                all.append("\n\n");
             }
+            all.append(sentMessages.get(i).getDetails());
         }
+        return all.toString();
     }
 
-    private static void showLongestStoredMessage(MessageManager manager) {
-        Message longest = manager.longestStoredMessage();
-        if (longest == null) {
-            System.out.println("There are no stored messages.");
-        } else {
-            System.out.println("Longest stored message: " + longest.getMessageText());
-        }
+    /**
+     * Returns the total number of messages sent while the program has been running.
+     *
+     * @return the number of sent messages
+     */
+    public static int returnTotalMessages() {
+        return sentMessages.size();
     }
 
-    private static void searchForMessageID(Scanner scanner, MessageManager manager) {
-        System.out.print("Enter the message ID: ");
-        String messageID = scanner.nextLine().trim();
-        Message found = manager.searchByMessageID(messageID);
-        if (found == null) {
-            System.out.println("No message found with the message ID: " + messageID);
-        } else {
-            System.out.println("Recipient: " + found.getRecipient());
-            System.out.println("Message: " + found.getMessageText());
-        }
+    // Package-private helpers so the unit tests start from a clean state.
+    static void resetSentMessages() {
+        sentMessages.clear();
     }
 
-    private static void searchForRecipient(Scanner scanner, MessageManager manager) {
-        System.out.print("Enter the recipient's cell number: ");
-        String recipient = scanner.nextLine().trim();
-        Message[] found = manager.searchByRecipient(recipient);
-        if (found.length == 0) {
-            System.out.println("No sent or stored messages found for " + recipient);
-        } else {
-            for (int i = 0; i < found.length; i++) {
-                System.out.println("Message " + (i + 1) + ": " + found[i].getMessageText());
-            }
-        }
+    static void setStorageFile(Path file) {
+        storageFile = file;
     }
 
-    // Keeps asking until the user enters a whole number between min and max.
-    private static int readNumber(Scanner scanner, String prompt, int min, int max) {
-        while (true) {
-            System.out.print(prompt);
-            String input = scanner.nextLine().trim();
-            try {
-                int value = Integer.parseInt(input);
-                if (value >= min && value <= max) {
-                    return value;
-                }
-            } catch (NumberFormatException e) {
-                // Not a number - fall through and ask again.
-            }
-            System.out.println("Please enter a number between " + min + " and " + max + ".");
-        }
+    public String getMessageID() {
+        return messageID;
+    }
+
+    public int getMessageNumber() {
+        return messageNumber;
+    }
+
+    public String getRecipient() {
+        return recipient;
+    }
+
+    public String getMessageText() {
+        return messageText;
+    }
+
+    public String getMessageHash() {
+        return messageHash;
     }
 }
+
